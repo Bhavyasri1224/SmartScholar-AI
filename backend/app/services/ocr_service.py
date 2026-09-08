@@ -1,12 +1,40 @@
+import os
 import pytesseract
-
 from PIL import Image, ImageOps, ImageEnhance
 import pymupdf
 
 
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_PATH = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+
+def _check_tesseract():
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception as exc:
+        raise RuntimeError("Tesseract OCR is not installed or TESSERACT_CMD is invalid") from exc
+
+
+def extract_document_text(file_path: str, mime_type: str | None) -> dict:
+    _check_tesseract()
+    if mime_type == "application/pdf":
+        document = pymupdf.open(file_path)
+        pages = []
+        for index, page in enumerate(document):
+            text = page.get_text().strip()
+            if len(text) < 20:
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
+                image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+                text = pytesseract.image_to_string(preprocess_image(image), config="--oem 3 --psm 6")
+            pages.append(f"--- Page {index + 1} ---\n{text}")
+        page_count = len(document)
+        document.close()
+    else:
+        with Image.open(file_path) as image:
+            pages = [pytesseract.image_to_string(preprocess_image(image), config="--oem 3 --psm 6")]
+        page_count = 1
+    return {"text": "\n\n".join(pages), "page_count": page_count, "status": "COMPLETED"}
 
 
 def preprocess_image(image: Image.Image) -> Image.Image:

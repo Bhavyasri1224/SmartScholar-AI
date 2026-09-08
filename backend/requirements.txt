@@ -6,3 +6,11 @@ pydantic
 python-dotenv
 alembic
 python-multipart
+python-jose[cryptography]
+pwdlib[argon2]
+email-validator
+PyMuPDF
+Pillow
+pytesseract
+pytest
+httpx

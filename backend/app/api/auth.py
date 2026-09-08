@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.schemas.auth import StudentRegisterRequest, StudentLoginRequest
 from app.database import get_db
 from app.models import User, StudentProfile
 from app.core.security import password_hash, create_access_token
+from app.services.audit_service import log_action
 
 
 router = APIRouter(
@@ -22,9 +23,7 @@ def register_student(
     ).first()
 
     if existing_user:
-        return {
-            "message": "Email already registered"
-        }
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
 
     hashed_password = password_hash.hash(data.password)
 
@@ -44,10 +43,16 @@ def register_student(
     )
 
     db.add(new_student)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Unable to create student account")
 
     db.refresh(new_user)
     db.refresh(new_student)
+    log_action(db, new_user.id, "registration", "User", new_user.id, {"role": "STUDENT"})
+    db.commit()
 
     return {
         "message": "Student registered successfully",

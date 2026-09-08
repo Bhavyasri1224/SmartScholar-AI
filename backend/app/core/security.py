@@ -16,6 +16,9 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY is required")
+
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -46,8 +49,36 @@ def get_current_user(
 
         return payload
 
-    except Exception:
+    except (jwt.JWTError, TypeError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token"
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"}
         )
+
+    user_id = payload.get("user_id")
+    role = payload.get("role")
+    if not isinstance(user_id, int) or not isinstance(role, str):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token claims",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    return payload
+
+
+def require_role(role: str):
+    def dependency(current_user=Depends(get_current_user)):
+        if current_user.get("role") != role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Only {role.lower()} users can access this resource"
+            )
+        return current_user
+
+    return dependency
+
+
+require_student = require_role("STUDENT")
+require_officer = require_role("OFFICER")

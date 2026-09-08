@@ -1,6 +1,26 @@
 import re
 
 
+def extract_document_fields(text: str, document_type: str) -> list[dict]:
+    patterns = {
+        "name": r"(?:name|applicant|student)\s*[:\-]\s*([A-Za-z][A-Za-z .]{2,})",
+        "date_of_birth": r"(?:date of birth|dob)\s*[:\-]\s*([0-9/.-]+)",
+        "aadhaar_number": r"\b([0-9]{4}\s?[0-9]{4}\s?[0-9]{4})\b",
+        "annual_income": r"(?:annual income|yearly income|income)\s*[:\-]?\s*(?:rs\.?\s*)?([0-9,]+)",
+        "certificate_number": r"(?:certificate no|certificate number)\s*[:\-]\s*([A-Za-z0-9/-]+)",
+        "percentage": r"(?:percentage|percent|%)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",
+        "year": r"\b(20[0-9]{2})\b",
+    }
+    fields = []
+    for field_name, pattern in patterns.items():
+        match = re.search(pattern, text or "", re.IGNORECASE)
+        if match:
+            value = re.sub(r"\s+", " ", match.group(1)).strip()
+            fields.append({"field_name": field_name, "field_value": value,
+                           "confidence": "0.85", "page_number": 1})
+    return fields
+
+
 def words_to_number(text: str):
     """
     Convert number words into numeric values.
