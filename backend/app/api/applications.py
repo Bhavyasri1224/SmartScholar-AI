@@ -1,10 +1,12 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from uuid import uuid4
 
-from app.core.security import require_student
+from app.core.security import get_current_user, require_student
 from app.database import get_db
-from app.models import AIFinding, AISummary, Application, Document, ExtractedField, StudentProfile
+from app.models import AIFinding, AISummary, Application, Document, ExtractedField, Scheme, StudentProfile
 from app.schemas.application import (
     ApplicationCreateRequest,
     ApplicationResponse,
@@ -12,6 +14,13 @@ from app.schemas.application import (
 )
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
+from app.services.analysis_service import (
+    ANALYSIS_FINDING_TYPES,
+    analyze_application as run_analysis,
+    serialize_finding,
+    serialize_summary,
+)
+from app.services.validation_service import validate_application_for_submission
 
 router = APIRouter(prefix="/api/applications", tags=["Applications"])
 EDITABLE_STATUSES = {"DRAFT", "NEEDS_CORRECTION"}
@@ -112,9 +121,15 @@ def submit_application(application_id: int, current_user=Depends(require_student
     application = owned_application(application_id, current_user, db)
     if application.status != "DRAFT":
         raise HTTPException(status_code=409, detail="Only draft applications can be submitted")
-    required = [application.scheme_name, application.college_name, application.course_name]
-    if any(value is None or str(value).strip() == "" for value in required):
-        raise HTTPException(status_code=422, detail="Required application information is missing")
+    documents = db.query(Document).filter(
+        Document.application_id == application.id
+    ).all()
+    scheme = None
+    if application.scheme_id is not None:
+        scheme = db.query(Scheme).filter(Scheme.id == application.scheme_id).first()
+    validation = validate_application_for_submission(application, documents, scheme)
+    if not validation["valid"]:
+        raise HTTPException(status_code=422, detail=validation)
     application.status = "SUBMITTED"
     create_notification(db, current_user["user_id"], "APPLICATION_SUBMITTED", "Application submitted",
                         "Your scholarship application was submitted.", application.id)
@@ -125,40 +140,63 @@ def submit_application(application_id: int, current_user=Depends(require_student
 
 
 @router.post("/{application_id}/analyze")
-def analyze_application(application_id: int, current_user=Depends(require_student), db: Session = Depends(get_db)):
-    application = owned_application(application_id, current_user, db)
+def analyze_application(application_id: int, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user["role"] == "STUDENT":
+        application = owned_application(application_id, current_user, db)
+    else:
+        application = db.query(Application).filter(Application.id == application_id).first()
+        if not application:
+            raise HTTPException(status_code=404, detail="Application not found")
+
     documents = db.query(Document).filter(Document.application_id == application.id).all()
-    findings = []
-    if not documents:
-        findings.append(AIFinding(application_id=application.id, finding_type="MISSING_DOCUMENT",
-                                  severity="HIGH", title="Documents missing",
-                                  description="Upload the required scholarship documents.", confidence="1.0"))
-    for document in documents:
-        fields = db.query(ExtractedField).filter(ExtractedField.document_id == document.id).all()
-        if document.ocr_status != "COMPLETED":
-            findings.append(AIFinding(application_id=application.id, finding_type="LOW_CONFIDENCE",
-                                      severity="MEDIUM", title="Document OCR incomplete",
-                                      description=f"Document {document.id} was not processed successfully.",
-                                      source_document_id=document.id, confidence="1.0"))
-        if not fields:
-            findings.append(AIFinding(application_id=application.id, finding_type="INVALID_DOCUMENT",
-                                      severity="MEDIUM", title="No fields extracted",
-                                      description=f"No structured fields were extracted from document {document.id}.",
-                                      source_document_id=document.id, confidence="0.8"))
-    db.query(AIFinding).filter(AIFinding.application_id == application.id).delete(synchronize_session=False)
-    for finding in findings:
-        db.add(finding)
-    result = "NOT_ELIGIBLE" if any(item.severity == "HIGH" for item in findings) else ("REVIEW_REQUIRED" if findings else "ELIGIBLE")
-    summary = AISummary(application_id=application.id,
-                        summary_text="Rule-based document and application review completed.",
-                        eligibility_result=result,
-                        risk_level="HIGH" if result == "NOT_ELIGIBLE" else ("MEDIUM" if findings else "LOW"),
-                        key_issues="; ".join(item.title for item in findings) or "No issues detected",
-                        evidence_summary=f"Reviewed {len(documents)} document(s).")
-    db.add(summary)
+    document_ids = [document.id for document in documents]
+    extracted_fields = []
+    if document_ids:
+        extracted_fields = db.query(ExtractedField).filter(
+            ExtractedField.document_id.in_(document_ids)
+        ).all()
+    profile = db.query(StudentProfile).filter(
+        StudentProfile.id == application.student_profile_id
+    ).first()
+    scheme = None
+    if application.scheme_id is not None:
+        scheme = db.query(Scheme).filter(Scheme.id == application.scheme_id).first()
+    result = run_analysis(application, profile, documents, extracted_fields, scheme)
+
+    db.query(AIFinding).filter(
+        AIFinding.application_id == application.id,
+        AIFinding.finding_type.in_(ANALYSIS_FINDING_TYPES),
+    ).delete(synchronize_session=False)
+    for finding in result["findings"]:
+        db.add(AIFinding(application_id=application.id, **finding))
+
+    summary = db.query(AISummary).filter(
+        AISummary.application_id == application.id
+    ).order_by(AISummary.created_at.desc(), AISummary.id.desc()).first()
+    if summary is None:
+        summary = AISummary(application_id=application.id)
+        db.add(summary)
+    summary.summary_text = result["summary_text"]
+    summary.eligibility_result = result["eligibility_result"]
+    summary.risk_level = result["risk_level"]
+    summary.key_issues = json.dumps(result["key_issues"])
+    summary.evidence_summary = result["evidence_summary"]
     log_action(db, current_user["user_id"], "application_analyzed", "Application", application.id)
     db.commit()
-    return {"application_id": application.id, "eligibility_result": result,
-            "risk_level": summary.risk_level, "findings": findings, "summary": summary}
+    db.refresh(summary)
+    saved_findings = db.query(AIFinding).filter(
+        AIFinding.application_id == application.id,
+        AIFinding.finding_type.in_(ANALYSIS_FINDING_TYPES),
+    ).order_by(AIFinding.id.asc()).all()
+    return {
+        "application_id": application.id,
+        "eligibility_result": result["eligibility_result"],
+        "risk_level": result["risk_level"],
+        "findings": [serialize_finding(finding) for finding in saved_findings],
+        "summary": serialize_summary(summary),
+        "recommendation": result["recommendation"],
+        "eligibility": result["eligibility"],
+        "completeness": result["completeness"],
+    }
 
 

@@ -1,23 +1,84 @@
 import re
+from collections.abc import Iterable
 
 
-def extract_document_fields(text: str, document_type: str) -> list[dict]:
-    patterns = {
-        "name": r"(?:name|applicant|student)\s*[:\-]\s*([A-Za-z][A-Za-z .]{2,})",
-        "date_of_birth": r"(?:date of birth|dob)\s*[:\-]\s*([0-9/.-]+)",
-        "aadhaar_number": r"\b([0-9]{4}\s?[0-9]{4}\s?[0-9]{4})\b",
-        "annual_income": r"(?:annual income|yearly income|income)\s*[:\-]?\s*(?:rs\.?\s*)?([0-9,]+)",
-        "certificate_number": r"(?:certificate no|certificate number)\s*[:\-]\s*([A-Za-z0-9/-]+)",
-        "percentage": r"(?:percentage|percent|%)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",
-        "year": r"\b(20[0-9]{2})\b",
+# This is a transparent heuristic based on labelled OCR text, not a model
+# confidence score. It preserves the existing confidence representation.
+HEURISTIC_CONFIDENCE = "0.85"
+
+
+def _field(field_name: str, value: str, page_number: int) -> dict:
+    return {
+        "field_name": field_name,
+        "field_value": re.sub(r"\s+", " ", value).strip(),
+        "confidence": HEURISTIC_CONFIDENCE,
+        "page_number": page_number,
     }
-    fields = []
-    for field_name, pattern in patterns.items():
-        match = re.search(pattern, text or "", re.IGNORECASE)
+
+
+def _first_match(text: str, patterns: Iterable[str]) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
-            value = re.sub(r"\s+", " ", match.group(1)).strip()
-            fields.append({"field_name": field_name, "field_value": value,
-                           "confidence": "0.85", "page_number": 1})
+            return match.group(1).strip()
+    return None
+
+
+def _extract_page_fields(text: str, document_type: str, page_number: int) -> list[dict]:
+    fields: list[dict] = []
+    if document_type == "MARKSHEET":
+        name = _first_match(text, (
+            r"(?:student\s+name|name|applicant|student)\s*[:\-]\s*([A-Za-z][A-Za-z .]{2,})",
+            r"This is to certify that\s+(.+?)(?=\s+Roll\s*No|\n|$)",
+        ))
+        roll_number = _first_match(text, (r"roll\s*(?:no|number)\.?\s*[:\-]?\s*([A-Za-z0-9/-]+)",))
+        board = _first_match(text, (r"board\s*[:\-]\s*([A-Za-z0-9 .&-]+)",))
+        marks = _first_match(text, (r"(?:total\s+)?marks\s*[:\-]\s*([0-9]+(?:\.[0-9]+)?)",))
+        percentage = _first_match(text, (r"(?:percentage|percent|%)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",))
+        passing_year = _first_match(text, (r"(?:passing\s+year|pass\s+year|year)\s*[:\-]?\s*(20[0-9]{2})",))
+        values = (
+            ("student_name", name),
+            ("roll_number", roll_number),
+            ("board", board),
+            ("marks", marks),
+            ("percentage", percentage),
+            ("year", passing_year),
+        )
+        fields.extend(_field(name, value, page_number) for name, value in values if value)
+    elif document_type == "INCOME_CERTIFICATE":
+        values = (
+            ("student_name", _first_match(text, (r"(?:student\s+name|name|applicant)\s*[:\-]\s*([A-Za-z][A-Za-z .]{2,})",))),
+            ("annual_income", _first_match(text, (r"(?:annual income|yearly income|income)\s*[:\-]?\s*(?:rs\.?\s*)?([0-9,]+)",))),
+            ("certificate_number", _first_match(text, (r"(?:certificate\s*(?:no|number))\s*[:\-]?\s*([A-Za-z0-9/-]+)",))),
+            ("issue_date", _first_match(text, (r"(?:issue date|issued on|date of issue)\s*[:\-]?\s*([0-9/.-]+)",))),
+        )
+        fields.extend(_field(name, value, page_number) for name, value in values if value)
+    elif document_type == "CASTE_CERTIFICATE":
+        values = (
+            ("student_name", _first_match(text, (r"(?:student\s+name|name|applicant)\s*[:\-]\s*([A-Za-z][A-Za-z .]{2,})",))),
+            ("category", _first_match(text, (r"(?:caste|category)\s*[:\-]\s*([A-Za-z][A-Za-z .-]+)",))),
+            ("certificate_number", _first_match(text, (r"(?:certificate\s*(?:no|number))\s*[:\-]?\s*([A-Za-z0-9/-]+)",))),
+            ("issue_date", _first_match(text, (r"(?:issue date|issued on|date of issue)\s*[:\-]?\s*([0-9/.-]+)",))),
+        )
+        fields.extend(_field(name, value, page_number) for name, value in values if value)
+    return fields
+
+
+def extract_document_fields(
+    text: str,
+    document_type: str,
+    pages: list[dict] | None = None,
+) -> list[dict]:
+    """Extract only fields supported by the classified document type."""
+    if pages is None:
+        pages = [{"page_number": 1, "text": text or ""}]
+    fields: list[dict] = []
+    for page in pages:
+        fields.extend(_extract_page_fields(
+            page.get("text", ""),
+            document_type,
+            int(page.get("page_number", 1)),
+        ))
     return fields
 
 

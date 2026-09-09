@@ -5,6 +5,10 @@ import os
 from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import User
 load_dotenv()
 
 # Password hashing
@@ -32,12 +36,26 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # JWT authentication
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
+
+VALID_ROLES = {"STUDENT", "OFFICER"}
+
+
+def authentication_error(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    db: Session = Depends(get_db),
 ):
+    if credentials is None:
+        raise authentication_error("Authentication credentials are required")
+
     token = credentials.credentials
 
     try:
@@ -47,25 +65,23 @@ def get_current_user(
             algorithms=[ALGORITHM]
         )
 
-        return payload
-
     except (jwt.JWTError, TypeError, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
+        raise authentication_error("Invalid or expired token")
 
     user_id = payload.get("user_id")
     role = payload.get("role")
-    if not isinstance(user_id, int) or not isinstance(role, str):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token claims",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
+    if not isinstance(user_id, int) or user_id <= 0:
+        raise authentication_error("Invalid token claims")
+    if not isinstance(role, str) or role not in VALID_ROLES:
+        raise authentication_error("Invalid token claims")
 
-    return payload
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise authentication_error("User no longer exists")
+    if user.role != role:
+        raise authentication_error("Invalid token claims")
+
+    return {"user_id": user.id, "role": user.role}
 
 
 def require_role(role: str):

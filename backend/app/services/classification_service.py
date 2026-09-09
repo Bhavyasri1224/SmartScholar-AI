@@ -10,9 +10,21 @@ KEYWORDS = {
 }
 
 
-def classify_document(text: str) -> str:
+def classify_document_result(text: str) -> dict:
     normalized = (text or "").lower()
-    for document_type, keywords in KEYWORDS.items():
-        if any(keyword in normalized for keyword in keywords):
-            return document_type
-    return "OTHER"
+    scores = {
+        document_type: sum(keyword in normalized for keyword in keywords)
+        for document_type, keywords in KEYWORDS.items()
+    }
+    document_type, score = max(scores.items(), key=lambda item: item[1])
+    if score == 0:
+        return {"document_type": "OTHER", "confidence": None}
+    total_keywords = len(KEYWORDS[document_type])
+    return {
+        "document_type": document_type,
+        "confidence": round(score / total_keywords, 2),
+    }
+
+
+def classify_document(text: str) -> str:
+    return classify_document_result(text)["document_type"]

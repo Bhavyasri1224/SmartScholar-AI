@@ -1,22 +1,44 @@
 import os
 import secrets
+import logging
+from io import BytesIO
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from PIL import Image
 from sqlalchemy.orm import Session
 
 from app.core.security import require_student
 from app.database import get_db
 from app.models import Application, Document, ExtractedField, StudentProfile
 from app.services.audit_service import log_action
-from app.services.classification_service import classify_document
+from app.services.classification_service import classify_document_result
 from app.services.extraction_service import extract_document_fields
 from app.services.ocr_service import extract_document_text
 
 router = APIRouter(tags=["Documents"])
+logger = logging.getLogger(__name__)
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads")).resolve()
 MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_TYPES = {"application/pdf", "image/jpeg", "image/png"}
+
+
+def _valid_file_signature(content: bytes, mime_type: str | None) -> bool:
+    if mime_type == "application/pdf":
+        return content.startswith(b"%PDF-")
+    if mime_type == "image/jpeg":
+        return content.startswith(b"\xff\xd8\xff")
+    if mime_type == "image/png":
+        return content.startswith(b"\x89PNG\r\n\x1a\n")
+    return False
+
+
+def _validate_image(content: bytes) -> None:
+    try:
+        with Image.open(BytesIO(content)) as image:
+            image.verify()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="The uploaded image is invalid or corrupted") from exc
 
 
 def owned_application(application_id, user_id, db):
@@ -57,6 +79,10 @@ def upload_document(application_id: int, document_type: str, file: UploadFile = 
     content = file.file.read(MAX_FILE_SIZE + 1)
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit")
+    if not content or not _valid_file_signature(content, file.content_type):
+        raise HTTPException(status_code=400, detail="Uploaded file content does not match its declared type")
+    if file.content_type in {"image/jpeg", "image/png"}:
+        _validate_image(content)
     folder = UPLOAD_DIR / str(application.id)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{secrets.token_hex(16)}{suffix}"
@@ -114,25 +140,34 @@ def process_document(document_id: int, current_user=Depends(require_student), db
         raise HTTPException(status_code=404, detail="Document not found")
     if document.ocr_status == "COMPLETED" and document.classification_status == "COMPLETED":
         return document_response(document)
+    document.ocr_status = "PROCESSING"
+    document.classification_status = "PROCESSING"
+    db.commit()
     try:
         result = extract_document_text(document.file_path, document.mime_type)
         document.page_count = result["page_count"]
         document.ocr_status = result["status"]
-        document.document_type = classify_document(result["text"])
+        classification = classify_document_result(result["text"])
+        document.document_type = classification["document_type"]
         document.classification_status = "COMPLETED"
         for field in db.query(ExtractedField).filter(ExtractedField.document_id == document.id).all():
             db.delete(field)
-        for item in extract_document_fields(result["text"], document.document_type):
+        for item in extract_document_fields(
+            result["text"],
+            document.document_type,
+            result.get("pages"),
+        ):
             db.add(ExtractedField(document_id=document.id, field_name=item["field_name"],
                                    field_value=item["field_value"], confidence=item["confidence"],
-                                   page_number=item.get("page_number", 1)))
+                                   page_number=item["page_number"]))
         log_action(db, current_user["user_id"], "document_processed", "Document", document.id)
         db.commit()
         db.refresh(document)
         return {**document_response(document), "text": result["text"]}
-    except Exception as exc:
+    except Exception:
+        logger.exception("Document processing failed for document %s", document_id)
         db.rollback()
         document.ocr_status = "FAILED"
         document.classification_status = "FAILED"
         db.commit()
-        raise HTTPException(status_code=422, detail=f"Document processing failed: {exc}")
+        raise HTTPException(status_code=422, detail="Document processing failed; verify the file and OCR configuration")

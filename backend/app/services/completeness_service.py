@@ -4,25 +4,30 @@ def check_document_completeness(document_types: list[str]) -> dict:
     """
 
     required_documents = [
-        "XII_MARKSHEET",
+        "MARKSHEET",
         "INCOME_CERTIFICATE"
     ]
 
     conditional_documents = [
-        "CATEGORY_CERTIFICATE",
+        "CASTE_CERTIFICATE",
         "DISABILITY_CERTIFICATE"
     ]
+
+    normalized_types = {
+        str(document_type).strip().upper()
+        for document_type in document_types
+    }
 
     missing_documents = []
 
     # Check required documents
     for document in required_documents:
-        if document not in document_types:
+        if document not in normalized_types:
             missing_documents.append(document)
 
     return {
         "is_complete": len(missing_documents) == 0,
         "missing_documents": missing_documents,
-        "uploaded_documents": document_types,
+        "uploaded_documents": sorted(normalized_types),
         "conditional_documents": conditional_documents
     }

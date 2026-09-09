@@ -1,40 +1,85 @@
 import os
-import pytesseract
-from PIL import Image, ImageOps, ImageEnhance
+
 import pymupdf
+import pytesseract
+from dotenv import load_dotenv
+from PIL import Image, ImageEnhance, ImageOps
 
 
-TESSERACT_PATH = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+load_dotenv()
+if os.getenv("TESSERACT_CMD"):
+    pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
 
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
-
-def _check_tesseract():
+def _check_tesseract() -> None:
     try:
         pytesseract.get_tesseract_version()
     except Exception as exc:
-        raise RuntimeError("Tesseract OCR is not installed or TESSERACT_CMD is invalid") from exc
+        raise RuntimeError("OCR is unavailable: configure TESSERACT_CMD or install Tesseract") from exc
+
+
+def _ocr_image(image: Image.Image) -> str:
+    return pytesseract.image_to_string(
+        preprocess_image(image),
+        config="--oem 3 --psm 6",
+    ).strip()
 
 
 def extract_document_text(file_path: str, mime_type: str | None) -> dict:
-    _check_tesseract()
     if mime_type == "application/pdf":
-        document = pymupdf.open(file_path)
-        pages = []
+        try:
+            document = pymupdf.open(file_path)
+        except Exception as exc:
+            raise ValueError("The uploaded PDF is invalid or corrupted") from exc
+
+        if len(document) == 0:
+            document.close()
+            raise ValueError("The uploaded PDF contains no pages")
+
+        pages: list[dict] = []
+        needs_ocr = False
         for index, page in enumerate(document):
             text = page.get_text().strip()
+            page_result = {"page_number": index + 1, "text": text}
+            pages.append(page_result)
             if len(text) < 20:
-                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
+                needs_ocr = True
+
+        if needs_ocr:
+            _check_tesseract()
+            for index, page in enumerate(document):
+                if len(pages[index]["text"]) >= 20:
+                    continue
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
                 image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
-                text = pytesseract.image_to_string(preprocess_image(image), config="--oem 3 --psm 6")
-            pages.append(f"--- Page {index + 1} ---\n{text}")
-        page_count = len(document)
+                pages[index]["text"] = _ocr_image(image)
         document.close()
+    elif mime_type in {"image/jpeg", "image/png"}:
+        try:
+            with Image.open(file_path) as image:
+                image.verify()
+            _check_tesseract()
+            with Image.open(file_path) as image:
+                pages = [{"page_number": 1, "text": _ocr_image(image)}]
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+            raise ValueError("The uploaded image is invalid or corrupted") from exc
     else:
-        with Image.open(file_path) as image:
-            pages = [pytesseract.image_to_string(preprocess_image(image), config="--oem 3 --psm 6")]
-        page_count = 1
-    return {"text": "\n\n".join(pages), "page_count": page_count, "status": "COMPLETED"}
+        raise ValueError("Unsupported document type")
+
+    text = "\n\n".join(
+        f"--- Page {page['page_number']} ---\n{page['text']}"
+        for page in pages
+    )
+    if not text.strip() or not any(page["text"].strip() for page in pages):
+        raise ValueError("No readable text was found in the document")
+    return {
+        "text": text,
+        "pages": pages,
+        "page_count": len(pages),
+        "status": "COMPLETED",
+    }
 
 
 def preprocess_image(image: Image.Image) -> Image.Image:
